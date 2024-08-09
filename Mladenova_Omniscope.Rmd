@@ -1,0 +1,376 @@
+---
+title: "Mladenova_MCA_Omniscope"
+author: "Tsvetelina Mladenova"
+date: "`r format(Sys.time(), '%d %b %Y')`"
+output: 
+  BiocStyle::html_document:
+    number_sections: true
+    toc_float: yes
+    wrap: sentence
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+library(knitr)
+library(DT)
+
+
+```
+
+**Introduction: We want to explore a multi-omic biomedical dataset from a study of 200 human Chronic Lymphocytic Leukaemia (CLL) samples which combines drug response with somatic mutation information, bulk transcriptome profiling, and DNA methylation assays For the sake of this assignment, the phenotype of interest will be a categorical feature representing sample biological sex annotation (target).**
+
+# Libraries & Data
+
+```{r libs & data, eval=T, message=FALSE, warning=FALSE}
+
+library(tidyverse)
+library(tidyr)
+library(dplyr)
+library(reshape2)
+library(broom)
+library(minfi)
+library(limma)
+library(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+library(purrr)
+library(ggplot2)
+library(grid)
+library(gridExtra)
+library(caret)
+library(randomForest)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(enrichplot)
+library(DOSE)
+library(magick)
+
+methylation <- read.csv("data/methylation_normalized.csv", header = TRUE, row.names = 1)
+expression <- read.csv("data/expr_normalized.csv", header = TRUE, row.names = 1)
+multiomics_data <- read.csv("data/multiomics_data.csv", header = TRUE, row.names = 1)
+
+multiomics_data$Gender <- as.factor(multiomics_data$Gender)
+
+```
+
+# Map Methylation Sites to Genes
+
+```{r Map Methylation Sites to Genes, eval=T}
+
+# Annotate
+annotation <- getAnnotation(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+matched_genes <- annotation[rownames(methylation), "UCSC_RefGene_Name"]
+methylation$Gene <- matched_genes
+
+# Aggregate Methylation Data by Gene
+cat("Number of observations:", nrow(methylation), "\n")
+
+methylation <- methylation %>%
+  separate_rows(Gene, sep = ";")
+
+cat("Number of observations:", nrow(methylation), "\n")
+
+methylation_agg <- methylation %>%
+  group_by(Gene) %>%
+  summarise(across(starts_with("H"), ~ mean(.x, na.rm = TRUE))) %>%
+  column_to_rownames(var = "Gene")
+```
+
+```{r Clean Gene Names, eval=T}
+
+# Check and clean Gene Names in methylation_agg
+rownames(methylation_agg) <- trimws(rownames(methylation_agg))  
+rownames(methylation_agg)[rownames(methylation_agg) == ""] <- "Unknown"
+
+cat("Number of missing row names:", sum(is.na(rownames(methylation_agg))), "\n")
+cat("Number of empty row names:", sum(rownames(methylation_agg) == ""), "\n")
+
+write.csv(methylation_agg, "methylation_agg.csv", row.names = TRUE)
+
+```
+
+
+```{r Continuous and Binary Variables, eval = T}
+
+# Identify continuous and binary variables
+continuous_vars <- names(multiomics_data)[sapply(multiomics_data, is.numeric)]
+binary_vars <- names(multiomics_data)[sapply(multiomics_data, function(x) all(x %in% c(0, 1)))]
+
+# Drop Gender
+continuous_vars <- setdiff(continuous_vars, "Gender")
+binary_vars <- setdiff(binary_vars, "Gender")
+
+
+```
+
+# Statistical Tests
+
+```{r Statistical Tests, eval = T}
+
+# t-tests 
+t_test_results <- lapply(continuous_vars, function(var) {
+  t_test <- t.test(as.formula(paste(var, "~ Gender")), data = multiomics_data)
+  tidy(t_test) %>% mutate(variable = var)
+}) %>% bind_rows()
+
+t_test_results <- t_test_results %>%
+  mutate(adj_p_value = p.adjust(p.value, method = "BH"))
+
+# Chi-square tests 
+chi_square_results <- lapply(binary_vars, function(var) {
+  tbl <- table(multiomics_data$Gender, multiomics_data[[var]])
+  chi_square <- chisq.test(tbl)
+  tidy(chi_square) %>% mutate(variable = var)
+}) %>% bind_rows()
+
+chi_square_results <- chi_square_results %>%
+  mutate(adj_p_value = p.adjust(p.value, method = "BH"))
+
+
+# Combine results
+all_results <- bind_rows(
+  t_test_results %>% mutate(test_type = "t-test"),
+  chi_square_results %>% mutate(test_type = "chi-square")
+)
+
+# Filter significant results
+significant_results <- all_results %>% filter(adj_p_value < 0.05)
+print(significant_results, n = Inf)
+
+# Check for duplicated variables
+duplicated_variables <- significant_results %>% 
+  filter(duplicated(variable) | duplicated(variable, fromLast = TRUE))
+print(duplicated_variables, n = Inf)
+
+unique_significant_results <- significant_results %>%
+  distinct(variable, .keep_all = TRUE)
+print(unique_significant_results, n = Inf)
+
+
+```
+
+
+```{r Visualization Significant Features, eval=T}
+
+# Distribution of significant features between genders
+significant_continuous_vars <- unique_significant_results %>% 
+  pull(variable)
+
+for (var in significant_continuous_vars) {
+  p <- ggplot(multiomics_data, aes(x = Gender, y = !!sym(var))) +
+    geom_boxplot() +
+    labs(title = paste("Boxplot of", var, "by Gender")) +
+    theme_minimal()
+
+  print(p)
+}
+
+```
+
+# Random Forest Model
+
+```{r Model Building, eval = T}
+
+#  Random Forest
+features <- multiomics_data[, significant_continuous_vars]
+target <- multiomics_data$Gender
+
+set.seed(123)
+trainIndex <- createDataPartition(target, p = .8, list = FALSE, times = 1)
+train_data <- features[trainIndex,]
+test_data <- features[-trainIndex,]
+train_target <- target[trainIndex]
+test_target <- target[-trainIndex]
+
+# Train 
+rf_model <- randomForest(x = train_data, y = train_target, ntree = 100)
+
+# Test
+predictions <- predict(rf_model, test_data)
+
+# Evaluate 
+confusionMatrix(predictions, test_target)
+
+```
+# Pathway Enrichment Analysis
+
+```{r Pathway Enrichment Analysis, eval=T, message=FALSE}
+
+# Extract significant 
+significant_genes <- significant_results %>% filter(test_type == "t-test") %>% dplyr::pull(variable)
+
+# Convert gene symbols to Entrez IDs
+gene_symbols <- gsub("_expr$", "", significant_genes)  
+entrez_ids <- bitr(gene_symbols, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+
+# GO analysis
+go_enrich <- enrichGO(gene = entrez_ids$ENTREZID,
+                      OrgDb = org.Hs.eg.db,
+                      keyType = "ENTREZID",
+                      ont = "BP",  
+                      pAdjustMethod = "BH",
+                      pvalueCutoff = 0.05,
+                      qvalueCutoff = 0.05)
+
+# KEGG analysis
+kegg_enrich <- enrichKEGG(gene = entrez_ids$ENTREZID,
+                          organism = "hsa",  
+                          pAdjustMethod = "BH",
+                          pvalueCutoff = 0.05,
+                          qvalueCutoff = 0.05)
+
+# Visualizations
+dotplot(go_enrich, showCategory = 10, title = "GO Enrichment Analysis")
+dotplot(kegg_enrich, showCategory = 10, title = "KEGG Pathway Enrichment Analysis")
+
+# Table results
+go_results <- as.data.frame(go_enrich)
+kegg_results <- as.data.frame(kegg_enrich)
+
+print("Top GO Enrichment Results:")
+print(head(go_results, 10))
+
+print("Top KEGG Pathway Enrichment Results:")
+print(head(kegg_results, 10))
+
+```
+
+# Methylation and Expression Analysis
+
+
+```{r Methylation and Gene Expression Correlation, eval = T}
+
+# Check samples are matching
+common_samples <- intersect(colnames(methylation), colnames(expression))
+methylation <- methylation[, common_samples]
+expression <- expression[, common_samples]
+
+# Trim leading or trailing spaces
+rownames(methylation_agg) <- trimws(rownames(methylation_agg))
+rownames(expression) <- trimws(rownames(expression))
+
+# Common genes 
+common_genes <- intersect(rownames(methylation_agg), rownames(expression))
+
+if (length(common_genes) == 0) {
+  stop("No common genes found. Please check the gene names in both datasets.")
+} else {
+  cat("Number of common genes found: ", length(common_genes), "\n")
+}
+
+# Subset the data to common genes
+methylation_agg <- methylation_agg[common_genes, ]
+expression <- expression[common_genes, ]
+
+# Function to calculate correlation
+calc_correlation <- possibly(function(gene) {
+  methylation_values <- as.numeric(methylation_agg[gene, ])
+  expression_values <- as.numeric(expression[gene, ])
+  
+  if (length(methylation_values) != length(expression_values)) {
+    warning(paste("Length mismatch for gene", gene))
+    return(NA)
+  }
+  
+  # Pearson correlation
+  cor(methylation_values, expression_values, method = "pearson")
+}, otherwise = NA_real_)
+
+
+# Correlations 
+correlations <- map_dbl(common_genes, calc_correlation)
+correlation_results <- data.frame(Gene = common_genes, Correlation = correlations)
+
+correlation_results$Significant <- ifelse(abs(correlation_results$Correlation) > 0.5, "Significant", "Not Significant")
+significant_genes <- correlation_results %>%
+  filter(Significant == "Significant")
+
+# Top positive correlations
+top_positive_genes <- significant_genes %>%
+  arrange(desc(Correlation)) %>%
+  head(1)
+
+# Top negative correlations
+top_negative_genes <- significant_genes %>%
+  arrange(Correlation) %>%
+  head(10)
+
+top_positive_table <- tableGrob(dplyr::select(top_positive_genes, Gene, Correlation), rows = NULL, theme = ttheme_minimal(base_size = 8))
+top_negative_table <- tableGrob(dplyr::select(top_negative_genes, Gene, Correlation), rows = NULL, theme = ttheme_minimal(base_size = 8))
+
+# Plot correlations 
+p <- ggplot(correlation_results, aes(x = reorder(Gene, Correlation), y = Correlation, fill = Significant)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Correlation between Methylation and Gene Expression",
+       x = "Gene",
+       y = "Correlation Coefficient") +
+  theme_minimal() +
+  scale_fill_manual(values = c("Significant" = "red", "Not Significant" = "grey")) +
+  theme(
+    axis.text.x = element_blank(), 
+    axis.ticks.x = element_blank(), 
+    axis.title.x = element_text(size = 12) 
+  )
+
+p + 
+  annotation_custom(grob = top_negative_table, xmin = -Inf, xmax = 0.3 * length(correlation_results$Gene), ymin = 0.1, ymax = 0.1) +
+  annotation_custom(grob = top_positive_table, xmin = 0.75 * length(correlation_results$Gene), xmax = Inf, ymin = -0.2, ymax = -0.1)
+
+# Histogram of correlation coefficients
+positive_count <- sum(correlation_results$Correlation > 0)
+negative_count <- sum(correlation_results$Correlation < 0)
+
+ggplot(correlation_results, aes(x = Correlation)) +
+  geom_histogram(binwidth = 0.1, alpha = 0.7, color = "black", linetype = "solid", linewidth = 0.2) +
+  labs(
+    title = "Distribution of Correlation Coefficients",
+    x = "Correlation Coefficient",
+    y = "Frequency"
+  ) +
+  theme_minimal(base_size = 15) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 18),
+    axis.title = element_text(face = "bold", size = 14),
+    axis.text = element_text(size = 12),
+    panel.grid.major = element_line(color = "grey80"),
+    panel.grid.minor = element_line(color = "grey90")
+  ) +
+  geom_vline(xintercept = 0, color = "black", linetype = "dashed", linewidth = 1) +
+  geom_density(aes(y = after_stat(count) * (0.1 * nrow(correlation_results))), 
+               adjust = 1.5) +
+  geom_density(data = subset(correlation_results, Correlation < 0), 
+               aes(y = after_stat(count) * (0.1 * nrow(correlation_results))), 
+               color = "red", linewidth = 1, adjust = 1.5) +
+  geom_density(data = subset(correlation_results, Correlation > 0), 
+               aes(y = after_stat(count) * (0.1 * nrow(correlation_results))), 
+               color = "#006400", linewidth = 1, adjust = 1.5) +
+  annotate("text", x = 0.3, y = 75000, label = paste("Positive Correlations\nCount:", positive_count), 
+           color = "#006400", size = 5, vjust = -1) +
+  annotate("text", x = -0.4, y = 75000, label = paste("Negative Correlations\nCount:", negative_count), 
+           color = "red", size = 5, vjust = -1) +
+  scale_x_continuous(breaks = seq(-1, 1, by = 0.1))
+
+```
+
+
+```{r Significant Methylation, eval=T}
+
+# Filter genes with correlation > 0.5 or < -0.5
+positive_genes <- correlation_results %>%
+  filter(Correlation > 0.5) %>%
+  arrange(desc(Correlation))
+
+negative_genes <- correlation_results %>%
+  filter(Correlation < -0.5) %>%
+  arrange(Correlation)
+
+feature_genes <- unique(c(positive_genes$Gene, negative_genes$Gene))
+feature_genes
+
+write.csv(feature_genes, "gene_correlation.csv", row.names = FALSE)
+
+```
+
+
+
+
